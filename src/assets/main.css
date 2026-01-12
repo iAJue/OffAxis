@@ -1,0 +1,34 @@
+:root {
+  color-scheme: dark;
+  --bg: #0b0f16;
+  --panel: rgba(15, 22, 35, 0.72);
+  --panel-border: rgba(255, 255, 255, 0.12);
+  --text: rgba(255, 255, 255, 0.92);
+  --muted: rgba(255, 255, 255, 0.72);
+  --accent: #8ab4ff;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji",
+    "Segoe UI Emoji";
+}
+
+a {
+  color: var(--accent);
+}
+
+button,
+select,
+input {
+  font: inherit;
+}
+
