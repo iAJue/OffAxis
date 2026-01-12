@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { updateOffAxisCamera } from '@/lib/offAxisCamera.js'
+import { createAnimeRoom } from '@/lib/animeRoom.js'
 
 /**
  * OffAxisViewer：离轴透视投影 Demo
@@ -47,10 +48,13 @@ let renderer
 let scene
 let camera
 let animationHandle = 0
+let animeRoom
 
 // ===== 屏幕平面（定义离轴投影的“真实屏幕”）=====
-// 约定：屏幕放在 z=0，屏幕高度固定为 1，宽度随 viewport aspect 改变。
-const screenHeight = 1.0
+// 约定：屏幕放在 z=0。
+// 注意：这是“虚拟屏幕尺寸”，决定你能看到的纵向范围（越大越像更大/更近的屏幕，视野更开阔）。
+// 之前 1.0 会导致人物（~1.25 高）容易被裁到只剩下腿；这里把屏幕高度调大一些更自然。
+const screenHeight = 1.5
 let screenWidth = 1.0
 
 // 屏幕矩形四个角点：pa(左下) pb(右下) pc(左上) pd(右上)
@@ -61,9 +65,9 @@ const pd = new THREE.Vector3()
 
 // ===== 眼睛位置 eye =====
 // 默认把 eye 的 y 抬高（更接近“站立视角”，避免贴地导致画面上下不舒适）
-const baseEye = new THREE.Vector3(0, 0.1, 1.25)
+const baseEye = new THREE.Vector3(0, 1, 1.25)
 // 模型整体放在屏幕后方（z 负方向），便于观察
-const baseModelZ = -2.4
+const baseModelZ = -1.4
 // 把模型缩放到一个近似统一的大小（不同 glb 也能在同一交互尺度下体验）
 const targetModelSize = 1.25
 // manualOffset：鼠标/键盘造成的偏移；trackedOffset：摄像头追踪造成的偏移
@@ -248,9 +252,13 @@ function updateScreenFromViewport() {
   screenWidth = screenHeight * aspect
 
   const z = 0
-  pa.set(-screenWidth / 2, -screenHeight / 2, z)
-  pb.set(screenWidth / 2, -screenHeight / 2, z)
-  pc.set(-screenWidth / 2, screenHeight / 2, z)
+  // 把“屏幕中心”放到 baseEye.y 附近：更符合“人站在地面上看屏幕”的直觉，
+  // 也能避免地面刚好落在屏幕中线，导致画面下半部分空旷。
+  const screenCenterY = 1
+  const centerY = screenCenterY
+  pa.set(-screenWidth / 2, centerY - screenHeight / 2, z) // 左下
+  pb.set(screenWidth / 2, centerY - screenHeight / 2, z) // 右下
+  pc.set(-screenWidth / 2, centerY + screenHeight / 2, z) // 左上
   pd.copy(pb).add(pc).sub(pa)
 
   if (screenFrame) {
@@ -438,6 +446,7 @@ function renderFrame(nowMs) {
 // 初始化 three.js 场景、网格、屏幕平面，以及 ResizeObserver
 function initThree() {
   scene = new THREE.Scene()
+  // 背景：默认纯色，后面会被二次元房间提供的渐变背景覆盖
   scene.background = new THREE.Color('#0b0f16')
 
   camera = new THREE.PerspectiveCamera(60, 1, 0.05, 60)
@@ -451,24 +460,41 @@ function initThree() {
     powerPreference: 'high-performance',
   })
   renderer.setPixelRatio(Math.min(window.devicePixelRatio ?? 1, 2))
+  renderer.shadowMap.enabled = true
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap
+  // 让色彩更“二次元”（更干净、饱和度更舒服）
+  renderer.outputColorSpace = THREE.SRGBColorSpace
+  renderer.toneMapping = THREE.ACESFilmicToneMapping
+  renderer.toneMappingExposure = 1.15
 
   mountEl.value.appendChild(canvas)
 
-  // 灯光：简单但足够让 glb 看清楚
-  const ambient = new THREE.AmbientLight(0xffffff, 0.6)
-  scene.add(ambient)
+  // 环境光：更柔和（配合二次元房间）
+  const hemi = new THREE.HemisphereLight(0xdbeafe, 0x0b0f16, 0.75)
+  hemi.position.set(0, 2, 0)
+  scene.add(hemi)
 
-  const dir = new THREE.DirectionalLight(0xffffff, 1.1)
-  dir.position.set(2, 3, 2)
-  scene.add(dir)
+  // 二次元房间（程序生成）
+  const room = createAnimeRoom({ baseZ: baseModelZ })
+  animeRoom = room.group
+  scene.add(room.group)
+  scene.background = room.backgroundTexture
 
-  const grid = new THREE.GridHelper(8, 16, 0x2a3350, 0x1d2336)
-  grid.position.z = baseModelZ
-  scene.add(grid)
+  // 推荐雾（可选）：增加景深层次
+  if (room.group.userData?.recommendedFog) {
+    const { color, density } = room.group.userData.recommendedFog
+    scene.fog = new THREE.FogExp2(color, density)
+  }
 
-  const axes = new THREE.AxesHelper(0.6)
-  axes.position.z = baseModelZ
-  scene.add(axes)
+  // 关键光与窗户补光
+  scene.add(room.keyLight)
+  scene.add(room.keyLight.target)
+  scene.add(room.windowLight)
+
+  // 轮廓光（rim light）：从背后打一点冷色，让角色更“跳出来”
+  const rim = new THREE.DirectionalLight(0x8ab4ff, 0.35)
+  rim.position.set(-2.8, 2.4, baseModelZ - 2.0)
+  scene.add(rim)
 
   // 屏幕边框（可视化“投影屏幕”）
   const frameGeom = new THREE.BufferGeometry()
@@ -498,6 +524,7 @@ function initThree() {
 
   function updateScreenPlane() {
     screenPlane.scale.set(screenWidth, screenHeight, 1)
+    screenPlane.position.set(0, baseEye.y, 0)
   }
 
   // 监听容器尺寸变化：更新 renderer 尺寸 + 屏幕平面
@@ -539,8 +566,7 @@ function loadModel() {
       const box = new THREE.Box3().setFromObject(model)
       const size = box.getSize(new THREE.Vector3())
 
-      const maxDim = Math.max(1e-6, size.x, size.y, size.z)
-      const scale = targetModelSize / maxDim
+      const scale = targetModelSize / Math.max(1e-6, size.y)
       model.scale.setScalar(scale)
       root.updateMatrixWorld(true)
 
@@ -557,6 +583,14 @@ function loadModel() {
 
       // 模型整体放到屏幕平面后方
       root.position.set(0, 0, baseModelZ)
+
+      // 开启阴影：让模型更“落地”，并与房间更融合
+      model.traverse((obj) => {
+        if (!obj?.isMesh) return
+        obj.castShadow = true
+        obj.receiveShadow = true
+      })
+
       trackingStatus.value = trackingEnabled.value ? 'Webcam on' : 'Manual'
     },
     undefined,
@@ -657,6 +691,9 @@ onBeforeUnmount(() => {
     renderer.dispose()
     renderer = null
   }
+
+  // 可选清理引用（让 GC 更容易回收）
+  animeRoom = null
 })
 </script>
 
