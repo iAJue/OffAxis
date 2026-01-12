@@ -1,5 +1,6 @@
 <script setup>
 import OffAxisViewer from '@/components/OffAxisViewer.vue'
+
 </script>
 
 <template>
@@ -11,4 +12,3 @@ import OffAxisViewer from '@/components/OffAxisViewer.vue'
   display: block;
 }
 </style>
-

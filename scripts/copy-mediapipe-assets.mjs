@@ -1,6 +1,22 @@
 import { cp, mkdir, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
+/**
+ * 这个脚本做两件事：
+ * 1) 把 `@mediapipe/tasks-vision` 里的 wasm 资源复制到 `public/vendor/mediapipe/wasm`
+ *    - 这样前端可以从本地路径加载 wasm，不依赖 jsdelivr 之类的 CDN。
+ * 2) （可选）下载 face_landmarker.task 到 `public/vendor/mediapipe/models/face_landmarker.task`
+ *    - 这是 FaceLandmarker 的模型文件，npm 包里不自带。
+ *
+ * 用法：
+ * - 仅复制 wasm（默认）：`node scripts/copy-mediapipe-assets.mjs`
+ * - 同时下载模型：      `node scripts/copy-mediapipe-assets.mjs --download-model`
+ *
+ * 注意：
+ * - 下载模型会走 `fetch()`（需要 Node 18+），并且需要能访问 Google Storage。
+ * - 如果网络无法访问 Google Storage，你需要手动把模型文件放到 models 目录。
+ */
+
 const repoRoot = process.cwd()
 
 const sourceDir = path.join(repoRoot, 'node_modules', '@mediapipe', 'tasks-vision')
@@ -58,6 +74,8 @@ async function main() {
 
   await mkdir(targetDir, { recursive: true })
   await mkdir(targetModelsDir, { recursive: true })
+
+  // wasm 文件每次都覆盖复制（版本升级后确保一致）
   await rm(targetWasmDir, { recursive: true, force: true })
   await cp(sourceWasmDir, targetWasmDir, { recursive: true })
 

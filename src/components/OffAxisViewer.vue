@@ -4,13 +4,25 @@ import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { updateOffAxisCamera } from '@/lib/offAxisCamera.js'
 
+/**
+ * OffAxisViewer：离轴透视投影 Demo
+ *
+ * 核心思路：
+ * - 在世界坐标里放一个“屏幕平面”（z=0 的矩形），用 pa/pb/pc 三点定义它的方向与尺寸。
+ * - 维护一个“眼睛位置 eye”（世界坐标），由鼠标/键盘/摄像头头部追踪驱动变化。
+ * - 每帧根据 (pa/pb/pc + eye) 计算【非对称视锥】并写入 camera.projectionMatrix，
+ *   同时把相机坐标系对齐到屏幕坐标系（见 src/lib/offAxisCamera.js）。
+ */
+
 const mountEl = ref(null)
 
+// ===== HUD/UI 状态 =====
 const trackingEnabled = ref(false)
 const trackingStatus = ref('Manual')
 const lastFaceConfidence = ref(null)
 const eyeText = ref('')
 
+// HUD 操作提示：根据是否启用摄像头动态切换
 const instructions = computed(() => {
   if (trackingEnabled.value) {
     return [
@@ -30,52 +42,70 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value))
 }
 
+// ===== three.js 对象（手动管理生命周期）=====
 let renderer
 let scene
 let camera
 let animationHandle = 0
 
+// ===== 屏幕平面（定义离轴投影的“真实屏幕”）=====
+// 约定：屏幕放在 z=0，屏幕高度固定为 1，宽度随 viewport aspect 改变。
 const screenHeight = 1.0
 let screenWidth = 1.0
 
+// 屏幕矩形四个角点：pa(左下) pb(右下) pc(左上) pd(右上)
 const pa = new THREE.Vector3()
 const pb = new THREE.Vector3()
 const pc = new THREE.Vector3()
 const pd = new THREE.Vector3()
 
-const baseEye = new THREE.Vector3(0, 0.7, 1.25)
+// ===== 眼睛位置 eye =====
+// 默认把 eye 的 y 抬高（更接近“站立视角”，避免贴地导致画面上下不舒适）
+const baseEye = new THREE.Vector3(0, 0.1, 1.25)
+// 模型整体放在屏幕后方（z 负方向），便于观察
 const baseModelZ = -2.4
+// 把模型缩放到一个近似统一的大小（不同 glb 也能在同一交互尺度下体验）
 const targetModelSize = 1.25
+// manualOffset：鼠标/键盘造成的偏移；trackedOffset：摄像头追踪造成的偏移
 const manualOffset = new THREE.Vector3(0, 0, 0)
 const trackedOffset = new THREE.Vector3(0, 0, 0)
+// 最终 eye = baseEye + manualOffset (+ trackedOffset)
 const eye = new THREE.Vector3()
 
 let screenFrame
 
+// ===== 鼠标拖拽状态 =====
 let isDragging = false
 let lastPointerX = 0
 let lastPointerY = 0
 
+// ===== 键盘状态：按住持续移动 =====
 const pressedKeys = new Set()
 let lastTime = performance.now()
 let lastUiTime = 0
 
+// ===== 摄像头头部追踪（MediaPipe FaceLandmarker）=====
 let videoEl = null
 let mediaStream = null
 let faceLandmarker = null
+// 记录“初始脸宽”，用于粗略估算前后移动（脸变大=靠近，脸变小=远离）
 let faceBaselineWidth = null
 let lastDetectTime = 0
+// 复用临时向量，避免频繁 new（降低 GC 抖动）
 const tmpVec3a = new THREE.Vector3()
 const tmpVec3b = new THREE.Vector3()
 
+// 开关：启用/禁用头部追踪（失败会自动回退到 Manual）
 function setTrackingEnabled(nextEnabled) {
   trackingEnabled.value = nextEnabled
   if (trackingEnabled.value) {
+    // getUserMedia 只能在安全上下文使用（localhost/https）
     if (!window.isSecureContext) {
       trackingEnabled.value = false
       trackingStatus.value = 'Webcam failed: insecure context（请用 http://localhost 打开，或 https）'
       return
     }
+    // 兜底：部分环境可能不支持
     if (!navigator.mediaDevices?.getUserMedia) {
       trackingEnabled.value = false
       trackingStatus.value = 'Webcam failed: getUserMedia not supported'
@@ -91,6 +121,7 @@ function setTrackingEnabled(nextEnabled) {
   }
 }
 
+// 把常见摄像头错误转换为更易懂的提示
 function formatWebcamError(err) {
   const name = err?.name ?? ''
   if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
@@ -108,9 +139,17 @@ function formatWebcamError(err) {
   return err?.message ?? String(err)
 }
 
+/**
+ * 启动头部追踪：
+ * 1) getUserMedia 打开摄像头
+ * 2) 创建 video 元素承载 stream
+ * 3) 加载 MediaPipe wasm（本地 /vendor/mediapipe/wasm）
+ * 4) 加载 FaceLandmarker 模型（优先本地，其次远程）
+ */
 async function startHeadTracking() {
   trackingStatus.value = 'Requesting camera permission...'
 
+  // 避免重复启动：先清掉旧资源
   stopHeadTracking()
 
   mediaStream = await navigator.mediaDevices.getUserMedia({
@@ -131,7 +170,9 @@ async function startHeadTracking() {
 
   trackingStatus.value = 'Loading face model...'
 
+  // 动态 import：只在需要时加载，减少首屏体积
   const vision = await import('@mediapipe/tasks-vision')
+  // WASM 本地化：不依赖 jsdelivr
   const fileset = await vision.FilesetResolver.forVisionTasks('/vendor/mediapipe/wasm')
 
   const localModelPath = '/vendor/mediapipe/models/face_landmarker.task'
@@ -140,6 +181,7 @@ async function startHeadTracking() {
 
   try {
     trackingStatus.value = 'Loading face model (local)...'
+    // 本地模型：推荐使用 npm 脚本下载/放置，避免网络不通
     faceLandmarker = await vision.FaceLandmarker.createFromOptions(fileset, {
       baseOptions: { modelAssetPath: localModelPath },
       runningMode: 'VIDEO',
@@ -155,7 +197,7 @@ async function startHeadTracking() {
       })
     } catch (err2) {
       throw new Error(
-        `Failed to load FaceLandmarker model. Put it at ${localModelPath} (run: npm run setup:mediapipe -- --download-model)`,
+        `Failed to load FaceLandmarker model. Put it at ${localModelPath} (run: npm run setup:mediapipe:model)`,
       )
     }
   }
@@ -165,6 +207,12 @@ async function startHeadTracking() {
   trackingStatus.value = 'Webcam on'
 }
 
+/**
+ * 停止头部追踪并释放资源：
+ * - faceLandmarker.close()
+ * - mediaStream tracks stop()
+ * - 清理 videoEl
+ */
 function stopHeadTracking({ keepStatus = false } = {}) {
   if (faceLandmarker?.close) faceLandmarker.close()
   faceLandmarker = null
@@ -186,6 +234,12 @@ function stopHeadTracking({ keepStatus = false } = {}) {
   if (!keepStatus) trackingStatus.value = 'Manual'
 }
 
+/**
+ * 根据当前 viewport 更新屏幕平面三点 pa/pb/pc：
+ * - 屏幕在 z=0
+ * - 高度固定为 1
+ * - 宽度随 aspect 变化
+ */
 function updateScreenFromViewport() {
   if (!renderer) return
   const size = renderer.getSize(new THREE.Vector2())
@@ -217,12 +271,14 @@ function updateScreenFromViewport() {
   }
 }
 
+// 重置视点：清空手动/追踪偏移，并重置“距离基准”
 function resetEye() {
   manualOffset.set(0, 0, 0)
   trackedOffset.set(0, 0, 0)
   faceBaselineWidth = null
 }
 
+// 键盘持续移动：按住方向键/QE，按 dt 移动偏移量
 function applyKeyboard(dtSeconds) {
   const maxX = screenWidth * 0.45
   const maxY = screenHeight * 0.45
@@ -244,6 +300,7 @@ function applyKeyboard(dtSeconds) {
   manualOffset.z = clamp(manualOffset.z, minZ - baseEye.z, maxZ - baseEye.z)
 }
 
+// 鼠标拖拽：把屏幕像素位移映射成屏幕平面单位位移（用于改变 eye 的 X/Y）
 function applyPointerDelta(deltaX, deltaY) {
   const maxX = screenWidth * 0.45
   const maxY = screenHeight * 0.45
@@ -259,6 +316,7 @@ function applyPointerDelta(deltaX, deltaY) {
   manualOffset.y = clamp(manualOffset.y + dy, -maxY, maxY)
 }
 
+// 滚轮：改变 eye 的 Z（靠近/远离屏幕）
 function applyWheel(deltaY) {
   const maxZ = 2.25
   const minZ = 0.35
@@ -267,6 +325,12 @@ function applyWheel(deltaY) {
   manualOffset.z = clamp(manualOffset.z + zoom, minZ - baseEye.z, maxZ - baseEye.z)
 }
 
+/**
+ * 头部追踪更新（最多 30fps）：
+ * - 用人脸关键点的包围盒中心 -> x/y 偏移
+ * - 用人脸宽度相对初始值 -> z 偏移
+ * - 用 lerp 做平滑，减少抖动
+ */
 function updateHeadTracking(nowMs) {
   if (!trackingEnabled.value) return
   if (!faceLandmarker || !videoEl) return
@@ -324,6 +388,7 @@ function updateHeadTracking(nowMs) {
   trackingStatus.value = 'Webcam on'
 }
 
+// 计算最终 eye 并更新离轴相机（投影矩阵 + 相机世界矩阵）
 function updateCamera() {
   const maxX = screenWidth * 0.45
   const maxY = screenHeight * 0.45
@@ -338,6 +403,7 @@ function updateCamera() {
   eye.y = clamp(eye.y, baseEye.y - maxY, baseEye.y + maxY)
   eye.z = clamp(eye.z, minZ, maxZ)
 
+  // 离轴投影：由 (eye + 屏幕三点) 计算非对称视锥
   updateOffAxisCamera({
     camera,
     eye,
@@ -349,6 +415,7 @@ function updateCamera() {
   })
 }
 
+// RAF 渲染循环：输入/追踪 -> 更新相机 -> render
 function renderFrame(nowMs) {
   animationHandle = requestAnimationFrame(renderFrame)
 
@@ -359,6 +426,7 @@ function renderFrame(nowMs) {
   updateHeadTracking(nowMs)
   updateCamera()
 
+  // HUD 文字节流更新，避免每帧触发 Vue 更新
   if (nowMs - lastUiTime > 100) {
     lastUiTime = nowMs
     eyeText.value = `eye = (${eye.x.toFixed(3)}, ${eye.y.toFixed(3)}, ${eye.z.toFixed(3)})`
@@ -367,12 +435,14 @@ function renderFrame(nowMs) {
   renderer.render(scene, camera)
 }
 
+// 初始化 three.js 场景、网格、屏幕平面，以及 ResizeObserver
 function initThree() {
   scene = new THREE.Scene()
   scene.background = new THREE.Color('#0b0f16')
 
   camera = new THREE.PerspectiveCamera(60, 1, 0.05, 60)
 
+  // 生成 canvas 并挂到容器里
   const canvas = document.createElement('canvas')
   renderer = new THREE.WebGLRenderer({
     canvas,
@@ -384,6 +454,7 @@ function initThree() {
 
   mountEl.value.appendChild(canvas)
 
+  // 灯光：简单但足够让 glb 看清楚
   const ambient = new THREE.AmbientLight(0xffffff, 0.6)
   scene.add(ambient)
 
@@ -399,6 +470,7 @@ function initThree() {
   axes.position.z = baseModelZ
   scene.add(axes)
 
+  // 屏幕边框（可视化“投影屏幕”）
   const frameGeom = new THREE.BufferGeometry()
   frameGeom.setAttribute(
     'position',
@@ -410,6 +482,7 @@ function initThree() {
   )
   scene.add(screenFrame)
 
+  // 屏幕半透明面（帮助理解屏幕位置）
   const screenPlaneGeom = new THREE.PlaneGeometry(1, 1, 1, 1)
   const screenPlane = new THREE.Mesh(
     screenPlaneGeom,
@@ -427,6 +500,7 @@ function initThree() {
     screenPlane.scale.set(screenWidth, screenHeight, 1)
   }
 
+  // 监听容器尺寸变化：更新 renderer 尺寸 + 屏幕平面
   const resizeObserver = new ResizeObserver(() => {
     const { width, height } = mountEl.value.getBoundingClientRect()
     renderer.setSize(Math.max(1, Math.floor(width)), Math.max(1, Math.floor(height)), true)
@@ -443,6 +517,7 @@ function initThree() {
   updateScreenPlane()
 }
 
+// 加载 public/1.glb，并把模型缩放/对齐到更适合展示的位置（脚底贴地 + X/Z 居中）
 function loadModel() {
   const loader = new GLTFLoader()
 
@@ -456,9 +531,11 @@ function loadModel() {
     (gltf) => {
       const model = gltf.scene
 
+      // 加入场景后再算包围盒（setFromObject 需要在树上）
       root.add(model)
       root.updateMatrixWorld(true)
 
+      // 第一次包围盒：估算缩放比例
       const box = new THREE.Box3().setFromObject(model)
       const size = box.getSize(new THREE.Vector3())
 
@@ -467,6 +544,7 @@ function loadModel() {
       model.scale.setScalar(scale)
       root.updateMatrixWorld(true)
 
+      // 缩放后重新算一次包围盒：用于对齐脚底/居中
       box.setFromObject(model)
       box.getSize(size)
       const center = box.getCenter(new THREE.Vector3())
@@ -477,6 +555,7 @@ function loadModel() {
       model.position.y -= minY
       root.updateMatrixWorld(true)
 
+      // 模型整体放到屏幕平面后方
       root.position.set(0, 0, baseModelZ)
       trackingStatus.value = trackingEnabled.value ? 'Webcam on' : 'Manual'
     },
@@ -487,9 +566,11 @@ function loadModel() {
   )
 }
 
+// DOM 交互：鼠标拖拽、滚轮、键盘
 function addDomEvents() {
   const canvas = renderer.domElement
 
+  // pointer 事件：左键拖拽移动视点 X/Y
   const onPointerDown = (ev) => {
     if (ev.button !== 0) return
     isDragging = true
@@ -513,6 +594,7 @@ function addDomEvents() {
     canvas.releasePointerCapture?.(ev.pointerId)
   }
 
+  // wheel：移动视点 Z
   const onWheel = (ev) => {
     ev.preventDefault()
     applyWheel(ev.deltaY)
@@ -524,6 +606,7 @@ function addDomEvents() {
   canvas.addEventListener('pointercancel', onPointerUp, { passive: true })
   canvas.addEventListener('wheel', onWheel, { passive: false })
 
+  // key：Esc 退出摄像头；R 重置；其余加入 pressedKeys 让 render loop 持续处理
   const onKeyDown = (ev) => {
     if (ev.code === 'Escape' && trackingEnabled.value) {
       setTrackingEnabled(false)
@@ -543,6 +626,7 @@ function addDomEvents() {
   window.addEventListener('keydown', onKeyDown)
   window.addEventListener('keyup', onKeyUp)
 
+  // 组件卸载时解绑事件
   onBeforeUnmount(() => {
     canvas.removeEventListener('pointerdown', onPointerDown)
     canvas.removeEventListener('pointermove', onPointerMove)
@@ -554,6 +638,7 @@ function addDomEvents() {
   })
 }
 
+// 组件挂载：初始化场景、加载模型、绑定交互、启动渲染循环
 onMounted(() => {
   initThree()
   loadModel()
@@ -561,6 +646,7 @@ onMounted(() => {
   renderFrame(performance.now())
 })
 
+// 组件卸载：停止 RAF、释放摄像头、释放 renderer
 onBeforeUnmount(() => {
   cancelAnimationFrame(animationHandle)
   stopHeadTracking()
