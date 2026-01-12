@@ -43,7 +43,9 @@ const pb = new THREE.Vector3()
 const pc = new THREE.Vector3()
 const pd = new THREE.Vector3()
 
-const baseEye = new THREE.Vector3(0, 0, 1.25)
+const baseEye = new THREE.Vector3(0, 0.7, 1.25)
+const baseModelZ = -2.4
+const targetModelSize = 1.25
 const manualOffset = new THREE.Vector3(0, 0, 0)
 const trackedOffset = new THREE.Vector3(0, 0, 0)
 const eye = new THREE.Vector3()
@@ -130,18 +132,33 @@ async function startHeadTracking() {
   trackingStatus.value = 'Loading face model...'
 
   const vision = await import('@mediapipe/tasks-vision')
-  const fileset = await vision.FilesetResolver.forVisionTasks(
-    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/wasm',
-  )
+  const fileset = await vision.FilesetResolver.forVisionTasks('/vendor/mediapipe/wasm')
 
-  faceLandmarker = await vision.FaceLandmarker.createFromOptions(fileset, {
-    baseOptions: {
-      modelAssetPath:
-        'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
-    },
-    runningMode: 'VIDEO',
-    numFaces: 1,
-  })
+  const localModelPath = '/vendor/mediapipe/models/face_landmarker.task'
+  const remoteModelPath =
+    'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task'
+
+  try {
+    trackingStatus.value = 'Loading face model (local)...'
+    faceLandmarker = await vision.FaceLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: localModelPath },
+      runningMode: 'VIDEO',
+      numFaces: 1,
+    })
+  } catch (err) {
+    try {
+      trackingStatus.value = 'Loading face model (remote)...'
+      faceLandmarker = await vision.FaceLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: remoteModelPath },
+        runningMode: 'VIDEO',
+        numFaces: 1,
+      })
+    } catch (err2) {
+      throw new Error(
+        `Failed to load FaceLandmarker model. Put it at ${localModelPath} (run: npm run setup:mediapipe -- --download-model)`,
+      )
+    }
+  }
 
   faceBaselineWidth = null
   lastFaceConfidence.value = null
@@ -317,8 +334,8 @@ function updateCamera() {
   eye.add(manualOffset)
   if (trackingEnabled.value) eye.add(trackedOffset)
 
-  eye.x = clamp(eye.x, -maxX, maxX)
-  eye.y = clamp(eye.y, -maxY, maxY)
+  eye.x = clamp(eye.x, baseEye.x - maxX, baseEye.x + maxX)
+  eye.y = clamp(eye.y, baseEye.y - maxY, baseEye.y + maxY)
   eye.z = clamp(eye.z, minZ, maxZ)
 
   updateOffAxisCamera({
@@ -375,11 +392,11 @@ function initThree() {
   scene.add(dir)
 
   const grid = new THREE.GridHelper(8, 16, 0x2a3350, 0x1d2336)
-  grid.position.z = -2
+  grid.position.z = baseModelZ
   scene.add(grid)
 
   const axes = new THREE.AxesHelper(0.6)
-  axes.position.z = -2
+  axes.position.z = baseModelZ
   scene.add(axes)
 
   const frameGeom = new THREE.BufferGeometry()
@@ -430,8 +447,8 @@ function loadModel() {
   const loader = new GLTFLoader()
 
   const root = new THREE.Group()
-  root.position.set(0, 0, -2.4)
   scene.add(root)
+  root.position.set(0, 0, 0)
 
   trackingStatus.value = 'Loading /1.glb ...'
   loader.load(
@@ -439,17 +456,28 @@ function loadModel() {
     (gltf) => {
       const model = gltf.scene
 
+      root.add(model)
+      root.updateMatrixWorld(true)
+
       const box = new THREE.Box3().setFromObject(model)
       const size = box.getSize(new THREE.Vector3())
-      const center = box.getCenter(new THREE.Vector3())
 
       const maxDim = Math.max(1e-6, size.x, size.y, size.z)
-      const scale = 1.25 / maxDim
-
+      const scale = targetModelSize / maxDim
       model.scale.setScalar(scale)
-      model.position.sub(center.multiplyScalar(scale))
+      root.updateMatrixWorld(true)
 
-      root.add(model)
+      box.setFromObject(model)
+      box.getSize(size)
+      const center = box.getCenter(new THREE.Vector3())
+      const minY = box.min.y
+
+      model.position.x -= center.x
+      model.position.z -= center.z
+      model.position.y -= minY
+      root.updateMatrixWorld(true)
+
+      root.position.set(0, 0, baseModelZ)
       trackingStatus.value = trackingEnabled.value ? 'Webcam on' : 'Manual'
     },
     undefined,

@@ -44,6 +44,24 @@ npm run dev
 - 右上角勾选“摄像头头部追踪”：用头部移动驱动 `eye`
 - `Esc`：关闭摄像头模式
 
+## Webcam Notes
+
+本项目会把 `@mediapipe/tasks-vision` 的 wasm 复制到 `public/vendor/mediapipe/wasm`（`postinstall` 自动执行，也可手动运行：
+
+```sh
+npm run setup:mediapipe
+```
+
+`FaceLandmarker` 的模型文件不随 npm 包分发：
+- 优先从本地加载：`public/vendor/mediapipe/models/face_landmarker.task`
+- 若本地不存在，会尝试从官方远程地址加载（如果网络不可达就会失败）
+
+可选：自动下载模型到本地（如果能访问 Google Storage）：
+
+```sh
+npm run setup:mediapipe:model
+```
+
 ### Compile and Minify for Production
 
 ```sh
