@@ -22,6 +22,8 @@ const trackingEnabled = ref(false)
 const trackingStatus = ref('Manual')
 const lastFaceConfidence = ref(null)
 const eyeText = ref('')
+const trackingMirrorX = ref(true)
+const trackingScale = ref(0.75)
 
 // HUD 操作提示：根据是否启用摄像头动态切换
 const instructions = computed(() => {
@@ -94,10 +96,15 @@ let mediaStream = null
 let faceLandmarker = null
 // 记录“初始脸宽”，用于粗略估算前后移动（脸变大=靠近，脸变小=远离）
 let faceBaselineWidth = null
+let faceBaselineCenterX = null
+let faceBaselineCenterY = null
 let lastDetectTime = 0
 // 复用临时向量，避免频繁 new（降低 GC 抖动）
 const tmpVec3a = new THREE.Vector3()
 const tmpVec3b = new THREE.Vector3()
+let lastFaceCenterX = null
+let lastFaceCenterY = null
+let lastFaceWidth = null
 
 // 开关：启用/禁用头部追踪（失败会自动回退到 Manual）
 function setTrackingEnabled(nextEnabled) {
@@ -284,6 +291,15 @@ function resetEye() {
   manualOffset.set(0, 0, 0)
   trackedOffset.set(0, 0, 0)
   faceBaselineWidth = null
+  faceBaselineCenterX = null
+  faceBaselineCenterY = null
+}
+
+function calibrateHeadTracking() {
+  if (lastFaceCenterX == null || lastFaceCenterY == null || lastFaceWidth == null) return
+  faceBaselineCenterX = lastFaceCenterX
+  faceBaselineCenterY = lastFaceCenterY
+  faceBaselineWidth = lastFaceWidth
 }
 
 // 键盘持续移动：按住方向键/QE，按 dt 移动偏移量
@@ -374,10 +390,22 @@ function updateHeadTracking(nowMs) {
   const centerY = (minLandmarkY + maxLandmarkY) / 2
   const faceWidth = Math.max(1e-6, maxLandmarkX - minLandmarkX)
 
+  lastFaceCenterX = centerX
+  lastFaceCenterY = centerY
+  lastFaceWidth = faceWidth
+
+  // 没校准时：第一帧检测到人脸就把当前位置当作“正中间”
+  if (faceBaselineCenterX == null) faceBaselineCenterX = centerX
+  if (faceBaselineCenterY == null) faceBaselineCenterY = centerY
   if (!faceBaselineWidth) faceBaselineWidth = faceWidth
 
-  const xNorm = (centerX - 0.5) * 2
-  const yNorm = (centerY - 0.5) * 2
+  // 人脸中心相对“校准中心”的位移（归一化到 [-1, 1] 左右）
+  // 注意：前置摄像头常见“镜像效果”，如果方向感觉不对可以关掉镜像。
+  let xNorm = (centerX - faceBaselineCenterX) * 2
+  const yNorm = (centerY - faceBaselineCenterY) * 2
+  if (trackingMirrorX.value) xNorm *= -1
+
+  // 前后移动：脸越大越近（width 变大），所以 baseline/width - 1 会变成负数（eye.z 变小）
   const zNorm = (faceBaselineWidth / faceWidth - 1)
 
   const maxX = screenWidth * 0.35
@@ -390,6 +418,9 @@ function updateHeadTracking(nowMs) {
     clamp(-yNorm * maxY, -maxY, maxY),
     clamp(zNorm * 0.9, minZ, maxZ),
   )
+
+  // 追踪灵敏度：整体缩放（越小越稳，越大位移越明显）
+  tmpVec3b.multiplyScalar(trackingScale.value)
 
   trackedOffset.lerp(tmpVec3b, 0.18)
   lastFaceConfidence.value = faceWidth
@@ -711,6 +742,9 @@ onBeforeUnmount(() => {
           />
           <span>摄像头头部追踪</span>
         </label>
+        <button class="btn" :disabled="!trackingEnabled" @click="calibrateHeadTracking">
+          校准（居中）
+        </button>
         <button class="btn" @click="resetEye">R 重置视点</button>
       </div>
 
@@ -726,6 +760,28 @@ onBeforeUnmount(() => {
         <div class="line">
           <span class="label">提示</span>
           <span class="value">{{ instructions }}</span>
+        </div>
+        <div v-if="trackingEnabled" class="line">
+          <span class="label">追踪</span>
+          <span class="value">
+            <label class="inline">
+              <input type="checkbox" :checked="trackingMirrorX" @change="trackingMirrorX = $event.target.checked" />
+              镜像X
+            </label>
+            <label class="inline">
+              灵敏度
+              <input
+                class="range"
+                type="range"
+                min="0.35"
+                max="1.2"
+                step="0.01"
+                :value="trackingScale"
+                @input="trackingScale = Number($event.target.value)"
+              />
+              {{ trackingScale.toFixed(2) }}
+            </label>
+          </span>
         </div>
       </div>
     </div>
@@ -793,6 +849,11 @@ onBeforeUnmount(() => {
   background: rgba(255, 255, 255, 0.1);
 }
 
+.btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .meta {
   margin-top: 10px;
   display: grid;
@@ -814,5 +875,18 @@ onBeforeUnmount(() => {
 
 .value {
   color: rgba(255, 255, 255, 0.9);
+}
+
+.inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-right: 12px;
+  user-select: none;
+}
+
+.range {
+  width: 160px;
+  accent-color: var(--accent);
 }
 </style>
