@@ -130,9 +130,21 @@
       import { DRACOLoader } from "three/addons/loaders/DRACOLoader.js";
 
       const MODELS = [
-        { name: "model.glb", url: "./model.glb" },
-        { name: "model2.glb", url: "./model2.glb" },
-        { name: "model3.glb", url: "./model3.glb" }
+        {
+          name: "model.glb",
+          url: "./model.glb",
+          transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: 1 }
+        },
+        {
+          name: "model2.glb",
+          url: "./model2.glb",
+          transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: 1 }
+        },
+        {
+          name: "model3.glb",
+          url: "./model3.glb",
+          transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: 1 }
+        }
       ];
 
       const canvas = document.getElementById("c");
@@ -221,6 +233,21 @@
 
       function setStatus(text) {
         statusEl.textContent = text ?? "";
+      }
+
+      function applyModelTransform(root, transform) {
+        if (!root || !transform) return;
+        const { position, rotation, scale } = transform;
+
+        if (position && position.length === 3) root.position.set(position[0], position[1], position[2]);
+        if (rotation && rotation.length === 3) root.rotation.set(rotation[0], rotation[1], rotation[2]);
+
+        if (scale !== undefined && scale !== null) {
+          if (Array.isArray(scale) && scale.length === 3) root.scale.set(scale[0], scale[1], scale[2]);
+          else root.scale.setScalar(Number(scale));
+        }
+
+        root.updateMatrixWorld(true);
       }
 
       function disposeObject3D(root) {
@@ -409,6 +436,7 @@
 
       async function loadModel(url) {
         setStatus("加载中…");
+        const modelConfig = MODELS.find((m) => m.url === url);
         return new Promise((resolve, reject) => {
           loader.load(
             url,
@@ -419,6 +447,7 @@
               }
               currentRoot = gltf.scene;
               scene.add(currentRoot);
+              applyModelTransform(currentRoot, modelConfig?.transform);
               fitCameraToObject(currentRoot);
               setupForModel(currentRoot);
               setStatus("");
