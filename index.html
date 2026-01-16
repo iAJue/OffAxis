@@ -42,6 +42,22 @@
         padding: 6px 10px;
         outline: none;
       }
+      #ui .toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        user-select: none;
+        cursor: pointer;
+        padding: 4px 8px;
+        border-radius: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        background: rgba(255, 255, 255, 0.06);
+      }
+      #ui input[type="checkbox"] {
+        width: 14px;
+        height: 14px;
+        accent-color: #f472b6;
+      }
       #status {
         font-size: 12px;
         color: rgba(255, 255, 255, 0.72);
@@ -62,6 +78,10 @@
     <div id="ui">
       <label for="modelSelect">模型</label>
       <select id="modelSelect"></select>
+      <label class="toggle" title="卡通分层光照 + 描边 + 粒子">
+        <input id="animeToggle" type="checkbox" checked />
+        场景
+      </label>
       <button id="reloadBtn" type="button">重载</button>
       <div id="status"></div>
     </div>
@@ -83,13 +103,16 @@
       const statusEl = document.getElementById("status");
       const selectEl = document.getElementById("modelSelect");
       const reloadBtn = document.getElementById("reloadBtn");
+      const animeToggleEl = document.getElementById("animeToggle");
 
       const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
       renderer.outputColorSpace = THREE.SRGBColorSpace;
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
       const scene = new THREE.Scene();
-      scene.background = new THREE.Color(0x0b1220);
+      scene.background = null;
 
       const camera = new THREE.PerspectiveCamera(50, 1, 0.01, 10_000);
       camera.position.set(2, 1.2, 2.2);
@@ -98,10 +121,17 @@
       controls.enableDamping = true;
       controls.dampingFactor = 0.08;
 
-      scene.add(new THREE.HemisphereLight(0xffffff, 0x223344, 1.0));
+      scene.add(new THREE.HemisphereLight(0xffffff, 0x223344, 1.05));
       const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
       dirLight.position.set(3, 6, 4);
+      dirLight.castShadow = true;
+      dirLight.shadow.mapSize.set(2048, 2048);
+      dirLight.shadow.bias = -0.00008;
       scene.add(dirLight);
+      scene.add(dirLight.target);
+      const rimLight = new THREE.DirectionalLight(0xffe4f1, 0.55);
+      rimLight.position.set(-4, 2, -3);
+      scene.add(rimLight);
 
       const loader = new GLTFLoader();
       const dracoLoader = new DRACOLoader();
@@ -109,6 +139,13 @@
       loader.setDRACOLoader(dracoLoader);
 
       let currentRoot = null;
+      const toonGradientMap = createToonGradientMap(5);
+      const sky = createGradientSky();
+      scene.add(sky);
+      const ground = createGround(toonGradientMap);
+      scene.add(ground);
+      const sparkles = createSparkles();
+      scene.add(sparkles);
 
       function setStatus(text) {
         statusEl.textContent = text ?? "";
@@ -116,26 +153,118 @@
 
       function disposeObject3D(root) {
         if (!root) return;
+        const disposedGeometries = new Set();
+        const disposedMaterials = new Set();
+        const disposedTextures = new Set();
+
         root.traverse((obj) => {
-          if (obj.geometry) obj.geometry.dispose();
-          const material = obj.material;
+          if (obj.userData?._origMaterial) collectMaterial(obj.userData._origMaterial);
+          if (obj.userData?._toonMaterial) collectMaterial(obj.userData._toonMaterial);
+
+          if (obj.geometry && !disposedGeometries.has(obj.geometry)) {
+            disposedGeometries.add(obj.geometry);
+            obj.geometry.dispose();
+          }
+          collectMaterial(obj.material);
+        });
+
+        function collectMaterial(material) {
           if (!material) return;
           if (Array.isArray(material)) {
-            for (const m of material) disposeMaterial(m);
+            for (const m of material) collectMaterial(m);
             return;
           }
-          disposeMaterial(material);
+          if (disposedMaterials.has(material)) return;
+          disposedMaterials.add(material);
+
+          for (const key of Object.keys(material)) {
+            const value = material[key];
+            if (value && typeof value === "object" && value.isTexture && !disposedTextures.has(value)) {
+              disposedTextures.add(value);
+              value.dispose();
+            }
+          }
+          material.dispose();
+        }
+      }
+
+      function applyAnimeStyle(root, enabled) {
+        root.traverse((obj) => {
+          if (!obj.isMesh) return;
+          if (obj.userData?._isOutline) return;
+
+          obj.castShadow = true;
+          obj.receiveShadow = true;
+
+          if (!obj.userData._origMaterial) {
+            obj.userData._origMaterial = obj.material;
+          }
+
+          if (enabled) {
+            if (!obj.userData._toonMaterial) {
+              obj.userData._toonMaterial = toToonMaterial(obj.userData._origMaterial);
+            }
+            obj.material = obj.userData._toonMaterial;
+            if (obj.material?.isMeshToonMaterial) {
+              if (obj.isSkinnedMesh) obj.material.skinning = true;
+              if (obj.morphTargetInfluences) {
+                obj.material.morphTargets = true;
+                obj.material.morphNormals = true;
+              }
+              obj.material.needsUpdate = true;
+            }
+            ensureOutline(obj, true);
+          } else {
+            obj.material = obj.userData._origMaterial;
+            ensureOutline(obj, false);
+          }
         });
       }
 
-      function disposeMaterial(material) {
-        for (const key of Object.keys(material)) {
-          const value = material[key];
-          if (value && typeof value === "object" && value.isTexture) {
-            value.dispose();
-          }
+      function toToonMaterial(original) {
+        const pick = Array.isArray(original) ? original[0] : original;
+        const toon = new THREE.MeshToonMaterial({
+          color: pick?.color?.clone?.() ?? new THREE.Color(0xffffff),
+          map: pick?.map ?? null,
+          transparent: Boolean(pick?.transparent),
+          opacity: pick?.opacity ?? 1,
+          side: pick?.side ?? THREE.FrontSide,
+          alphaTest: pick?.alphaTest ?? 0,
+          gradientMap: toonGradientMap
+        });
+        if (pick?.emissive) toon.emissive.copy(pick.emissive);
+        if (pick?.emissiveMap) toon.emissiveMap = pick.emissiveMap;
+        return toon;
+      }
+
+      function ensureOutline(mesh, enabled) {
+        if (mesh.isSkinnedMesh) return;
+        if (enabled) {
+          if (mesh.userData._outlineMesh) return;
+          const outlineMat = new THREE.MeshBasicMaterial({
+            color: 0x111827,
+            side: THREE.BackSide,
+            transparent: true,
+            opacity: 0.95,
+            depthWrite: false,
+            polygonOffset: true,
+            polygonOffsetFactor: 1,
+            polygonOffsetUnits: 1
+          });
+          const outline = new THREE.Mesh(mesh.geometry, outlineMat);
+          outline.frustumCulled = false;
+          outline.scale.setScalar(1.03);
+          outline.userData._isOutline = true;
+          mesh.add(outline);
+          mesh.userData._outlineMesh = outline;
+          return;
         }
-        material.dispose();
+
+        const outline = mesh.userData._outlineMesh;
+        if (!outline) return;
+        mesh.remove(outline);
+        outline.material.dispose();
+        mesh.userData._outlineMesh = null;
       }
 
       function fitCameraToObject(object3d) {
@@ -160,6 +289,50 @@
         controls.update();
       }
 
+      function setupForModel(root) {
+        if (!root) return;
+        const box = new THREE.Box3().setFromObject(root);
+        if (!Number.isFinite(box.min.x) || box.isEmpty()) return;
+
+        const size = box.getSize(new THREE.Vector3());
+        const center = box.getCenter(new THREE.Vector3());
+        const maxDim = Math.max(size.x, size.y, size.z);
+
+        applyAnimeStyle(root, animeToggleEl.checked);
+        updateEnvironmentStyle();
+
+        const groundY = box.min.y - maxDim * 0.02;
+        ground.position.set(center.x, groundY, center.z);
+        ground.scale.setScalar(Math.max(maxDim * 1.35, 1));
+
+        sparkles.userData.radius = maxDim;
+        sparkles.position.copy(center);
+        resetSparkles(sparkles);
+        dirLight.target.position.copy(center);
+        dirLight.target.updateMatrixWorld();
+
+        const shadowSpan = maxDim * 2.5;
+        dirLight.shadow.camera.left = -shadowSpan;
+        dirLight.shadow.camera.right = shadowSpan;
+        dirLight.shadow.camera.top = shadowSpan;
+        dirLight.shadow.camera.bottom = -shadowSpan;
+        dirLight.shadow.camera.near = 0.1;
+        dirLight.shadow.camera.far = Math.max(maxDim * 10, 50);
+        dirLight.shadow.camera.updateProjectionMatrix();
+      }
+
+      function updateEnvironmentStyle() {
+        const enabled = animeToggleEl.checked;
+        sky.material.uniforms.topColor.value.set(enabled ? 0x60a5fa : 0x0b1220);
+        sky.material.uniforms.bottomColor.value.set(enabled ? 0xfbcfe8 : 0x0b1220);
+        ground.visible = true;
+        ground.material.color.set(enabled ? 0xf8fafc : 0x111827);
+        ground.material.opacity = enabled ? 0.96 : 0.45;
+        ground.material.transparent = true;
+        ground.material.needsUpdate = true;
+        sparkles.visible = enabled;
+      }
+
       async function loadModel(url) {
         setStatus("加载中…");
         return new Promise((resolve, reject) => {
@@ -173,6 +346,7 @@
               currentRoot = gltf.scene;
               scene.add(currentRoot);
               fitCameraToObject(currentRoot);
+              setupForModel(currentRoot);
               setStatus("");
               resolve();
             },
@@ -202,6 +376,8 @@
       function animate() {
         resize();
         controls.update();
+        const t = performance.now() * 0.001;
+        updateSparkles(sparkles, t);
         renderer.render(scene, camera);
         requestAnimationFrame(animate);
       }
@@ -221,9 +397,214 @@
         loadModel(selectEl.value);
       });
 
+      animeToggleEl.addEventListener("change", () => {
+        if (currentRoot) applyAnimeStyle(currentRoot, animeToggleEl.checked);
+        updateEnvironmentStyle();
+      });
+
       await loadModel(selectEl.value || MODELS[0]?.url);
       animate();
+
+      function createToonGradientMap(steps) {
+        const data = new Uint8Array(steps * 4);
+        for (let i = 0; i < steps; i++) {
+          const v = Math.round((i / (steps - 1)) * 255);
+          data[i * 4 + 0] = v;
+          data[i * 4 + 1] = v;
+          data[i * 4 + 2] = v;
+          data[i * 4 + 3] = 255;
+        }
+        const tex = new THREE.DataTexture(data, steps, 1, THREE.RGBAFormat);
+        tex.needsUpdate = true;
+        tex.minFilter = THREE.NearestFilter;
+        tex.magFilter = THREE.NearestFilter;
+        tex.generateMipmaps = false;
+        return tex;
+      }
+
+      function createGradientSky() {
+        const geo = new THREE.SphereGeometry(1, 32, 16);
+        const mat = new THREE.ShaderMaterial({
+          side: THREE.BackSide,
+          depthWrite: false,
+          uniforms: {
+            topColor: { value: new THREE.Color(0x60a5fa) },
+            bottomColor: { value: new THREE.Color(0xfbcfe8) }
+          },
+          vertexShader: `
+            varying vec3 vWorldPosition;
+            void main() {
+              vWorldPosition = position;
+              gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            }
+          `,
+          fragmentShader: `
+            uniform vec3 topColor;
+            uniform vec3 bottomColor;
+            varying vec3 vWorldPosition;
+            void main() {
+              float h = normalize(vWorldPosition).y;
+              float t = smoothstep(-0.15, 0.9, h);
+              vec3 col = mix(bottomColor, topColor, t);
+              gl_FragColor = vec4(col, 1.0);
+            }
+          `
+        });
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.scale.setScalar(5000);
+        mesh.frustumCulled = false;
+        return mesh;
+      }
+
+      function createGround(gradientMap) {
+        const tex = createGroundTexture();
+        const mat = new THREE.MeshToonMaterial({
+          color: 0xf8fafc,
+          map: tex,
+          gradientMap,
+          transparent: true,
+          opacity: 0.96
+        });
+        const mesh = new THREE.Mesh(new THREE.CircleGeometry(1, 96), mat);
+        mesh.rotation.x = -Math.PI / 2;
+        mesh.receiveShadow = true;
+        return mesh;
+      }
+
+      function createGroundTexture() {
+        const canvas = document.createElement("canvas");
+        canvas.width = 512;
+        canvas.height = 512;
+        const ctx = canvas.getContext("2d");
+
+        const grd = ctx.createRadialGradient(256, 256, 10, 256, 256, 256);
+        grd.addColorStop(0, "rgba(255,255,255,0.95)");
+        grd.addColorStop(1, "rgba(255,255,255,0.35)");
+        ctx.fillStyle = grd;
+        ctx.fillRect(0, 0, 512, 512);
+
+        ctx.strokeStyle = "rgba(15, 23, 42, 0.08)";
+        ctx.lineWidth = 2;
+        for (let r = 40; r <= 240; r += 40) {
+          ctx.beginPath();
+          ctx.arc(256, 256, r, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+
+        const tex = new THREE.CanvasTexture(canvas);
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.wrapS = THREE.ClampToEdgeWrapping;
+        tex.wrapT = THREE.ClampToEdgeWrapping;
+        tex.anisotropy = 2;
+        return tex;
+      }
+
+      function createSparkles() {
+        const count = 220;
+        const positions = new Float32Array(count * 3);
+        const basePositions = new Float32Array(count * 3);
+        const meta = new Float32Array(count * 2);
+        for (let i = 0; i < count; i++) {
+          meta[i * 2 + 0] = Math.random() * Math.PI * 2;
+          meta[i * 2 + 1] = 0.6 + Math.random() * 1.2;
+        }
+
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+
+        const mat = new THREE.PointsMaterial({
+          size: 0.03,
+          map: createSparkleTexture(),
+          transparent: true,
+          opacity: 0.85,
+          depthWrite: false,
+          blending: THREE.AdditiveBlending
+        });
+        const points = new THREE.Points(geo, mat);
+        points.frustumCulled = false;
+        points.userData.radius = 1;
+        points.userData.basePositions = basePositions;
+        points.userData.meta = meta;
+        return points;
+      }
+
+      function resetSparkles(points) {
+        const radius = Math.max(points.userData.radius, 1);
+        const positions = points.geometry.attributes.position.array;
+        const basePositions = points.userData.basePositions;
+        const meta = points.userData.meta;
+        const count = positions.length / 3;
+
+        for (let i = 0; i < count; i++) {
+          const r = radius * (0.15 + Math.random() * 0.95);
+          const a = Math.random() * Math.PI * 2;
+          const y = (Math.random() * 0.9 + 0.05) * radius * 0.55;
+          const x = Math.cos(a) * r;
+          const z = Math.sin(a) * r;
+          const yy = y;
+
+          basePositions[i * 3 + 0] = x;
+          basePositions[i * 3 + 1] = yy;
+          basePositions[i * 3 + 2] = z;
+
+          positions[i * 3 + 0] = x;
+          positions[i * 3 + 1] = yy;
+          positions[i * 3 + 2] = z;
+
+          meta[i * 2 + 0] = Math.random() * Math.PI * 2;
+          meta[i * 2 + 1] = 0.6 + Math.random() * 1.2;
+        }
+        points.geometry.attributes.position.needsUpdate = true;
+      }
+
+      function updateSparkles(points, timeSec) {
+        if (!points.visible) return;
+        const radius = Math.max(points.userData.radius, 1);
+        const positions = points.geometry.attributes.position.array;
+        const basePositions = points.userData.basePositions;
+        const meta = points.userData.meta;
+        const count = positions.length / 3;
+
+        for (let i = 0; i < count; i++) {
+          const phase = meta[i * 2 + 0];
+          const speed = meta[i * 2 + 1];
+          positions[i * 3 + 0] = basePositions[i * 3 + 0];
+          positions[i * 3 + 1] =
+            basePositions[i * 3 + 1] + Math.sin(timeSec * speed + phase) * radius * 0.02;
+          positions[i * 3 + 2] = basePositions[i * 3 + 2];
+        }
+        points.rotation.y += 0.0012;
+        points.geometry.attributes.position.needsUpdate = true;
+      }
+
+      function createSparkleTexture() {
+        const canvas = document.createElement("canvas");
+        canvas.width = 128;
+        canvas.height = 128;
+        const ctx = canvas.getContext("2d");
+        ctx.clearRect(0, 0, 128, 128);
+
+        ctx.translate(64, 64);
+        ctx.fillStyle = "rgba(255,255,255,1)";
+        ctx.beginPath();
+        for (let i = 0; i < 8; i++) {
+          const ang = (i / 8) * Math.PI * 2;
+          const r = i % 2 === 0 ? 46 : 14;
+          const x = Math.cos(ang) * r;
+          const y = Math.sin(ang) * r;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.closePath();
+        ctx.fill();
+
+        const tex = new THREE.CanvasTexture(canvas);
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.minFilter = THREE.LinearMipmapLinearFilter;
+        tex.magFilter = THREE.LinearFilter;
+        tex.generateMipmaps = true;
+        return tex;
+      }
     </script>
   </body>
 </html>
-
