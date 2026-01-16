@@ -58,10 +58,34 @@
         height: 14px;
         accent-color: #f472b6;
       }
+      #ui input[type="range"] {
+        width: 120px;
+      }
+      #ui .small {
+        font-size: 12px;
+        color: rgba(255, 255, 255, 0.72);
+      }
       #status {
         font-size: 12px;
         color: rgba(255, 255, 255, 0.72);
         min-width: 160px;
+      }
+      #webcamPane {
+        position: fixed;
+        right: 12px;
+        bottom: 12px;
+        width: 180px;
+        border-radius: 12px;
+        overflow: hidden;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        background: rgba(10, 18, 34, 0.72);
+        display: none;
+      }
+      #webcamPane video {
+        width: 100%;
+        height: auto;
+        display: block;
+        transform: scaleX(-1);
       }
     </style>
 
@@ -82,10 +106,22 @@
         <input id="animeToggle" type="checkbox" checked />
         场景
       </label>
+      <label class="toggle" title="离轴投影（off-axis）+ 头动追踪（单人）">
+        <input id="offAxisToggle" type="checkbox" />
+        裸眼3D
+      </label>
+      <label class="small" title="头动幅度（鼠标也可模拟）">
+        强度
+        <input id="parallaxGain" type="range" min="0" max="2" step="0.01" value="1" />
+      </label>
+      <button id="trackBtn" type="button">开启追踪</button>
       <button id="reloadBtn" type="button">重载</button>
       <div id="status"></div>
     </div>
     <canvas id="c"></canvas>
+    <div id="webcamPane" aria-hidden="true">
+      <video id="webcam" autoplay playsinline muted></video>
+    </div>
 
     <script type="module">
       import * as THREE from "three";
@@ -104,6 +140,11 @@
       const selectEl = document.getElementById("modelSelect");
       const reloadBtn = document.getElementById("reloadBtn");
       const animeToggleEl = document.getElementById("animeToggle");
+      const offAxisToggleEl = document.getElementById("offAxisToggle");
+      const parallaxGainEl = document.getElementById("parallaxGain");
+      const trackBtn = document.getElementById("trackBtn");
+      const webcamPane = document.getElementById("webcamPane");
+      const webcamVideo = document.getElementById("webcam");
 
       const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -139,6 +180,37 @@
       loader.setDRACOLoader(dracoLoader);
 
       let currentRoot = null;
+      const offAxis = {
+        enabled: false,
+        tracking: false,
+        screenOrigin: new THREE.Vector3(0, 0, 0),
+        screenHeight: 1,
+        baseDistance: 2,
+        head: new THREE.Vector3(0, 0, 2),
+        headTarget: new THREE.Vector3(0, 0, 2),
+        refEyeDist: null,
+        stream: null,
+        faceLandmarker: null,
+        lastVideoTime: -1
+      };
+      const normalCameraState = {
+        position: new THREE.Vector3(),
+        quaternion: new THREE.Quaternion(),
+        target: new THREE.Vector3()
+      };
+      const offAxisTmp = {
+        pa: new THREE.Vector3(),
+        pb: new THREE.Vector3(),
+        pc: new THREE.Vector3(),
+        vr: new THREE.Vector3(),
+        vu: new THREE.Vector3(),
+        vn: new THREE.Vector3(),
+        va: new THREE.Vector3(),
+        vb: new THREE.Vector3(),
+        vc: new THREE.Vector3(),
+        eye: new THREE.Vector3(),
+        basis: new THREE.Matrix4()
+      };
       const toonGradientMap = createToonGradientMap(5);
       const sky = createGradientSky();
       scene.add(sky);
@@ -319,6 +391,8 @@
         dirLight.shadow.camera.near = 0.1;
         dirLight.shadow.camera.far = Math.max(maxDim * 10, 50);
         dirLight.shadow.camera.updateProjectionMatrix();
+
+        updateOffAxisDefaults(center, maxDim);
       }
 
       function updateEnvironmentStyle() {
@@ -368,16 +442,21 @@
         const width = canvas.clientWidth;
         const height = canvas.clientHeight;
         if (width === 0 || height === 0) return;
-        camera.aspect = width / height;
-        camera.updateProjectionMatrix();
         renderer.setSize(width, height, false);
+        if (!offAxis.enabled) {
+          camera.aspect = width / height;
+          camera.updateProjectionMatrix();
+        }
       }
 
       function animate() {
         resize();
-        controls.update();
+        if (!offAxis.enabled) controls.update();
+        updateHeadTracking();
+        if (offAxis.enabled) updateOffAxisCamera();
         const t = performance.now() * 0.001;
         updateSparkles(sparkles, t);
+        sky.position.copy(camera.position);
         renderer.render(scene, camera);
         requestAnimationFrame(animate);
       }
@@ -402,8 +481,213 @@
         updateEnvironmentStyle();
       });
 
+      offAxisToggleEl.addEventListener("change", () => {
+        setOffAxisEnabled(offAxisToggleEl.checked);
+      });
+
+      trackBtn.addEventListener("click", async () => {
+        if (offAxis.tracking) stopTracking();
+        else await startTracking();
+      });
+
+      window.addEventListener(
+        "pointermove",
+        (e) => {
+          if (!offAxis.enabled) return;
+          if (offAxis.tracking) return;
+          const width = canvas.clientWidth;
+          const height = canvas.clientHeight;
+          if (width === 0 || height === 0) return;
+          const aspect = width / height;
+          const screenWidth = offAxis.screenHeight * aspect;
+          const gain = Number(parallaxGainEl.value);
+          const x = (e.clientX / width - 0.5) * screenWidth * gain;
+          const y = -(e.clientY / height - 0.5) * offAxis.screenHeight * gain;
+          offAxis.headTarget.set(x, y, offAxis.baseDistance);
+        },
+        { passive: true }
+      );
+
       await loadModel(selectEl.value || MODELS[0]?.url);
       animate();
+
+      function setOffAxisEnabled(enabled) {
+        offAxis.enabled = enabled;
+        controls.enabled = !enabled;
+
+        if (enabled) {
+          normalCameraState.position.copy(camera.position);
+          normalCameraState.quaternion.copy(camera.quaternion);
+          normalCameraState.target.copy(controls.target);
+          camera.matrixAutoUpdate = false;
+          if (!offAxis.tracking) setStatus("提示：移动鼠标可模拟头动");
+          if (currentRoot) setupForModel(currentRoot);
+          return;
+        }
+
+        camera.matrixAutoUpdate = true;
+        camera.position.copy(normalCameraState.position);
+        camera.quaternion.copy(normalCameraState.quaternion);
+        controls.target.copy(normalCameraState.target);
+        controls.update();
+        if (currentRoot) fitCameraToObject(currentRoot);
+        setStatus("");
+      }
+
+      function updateOffAxisDefaults(center, maxDim) {
+        offAxis.screenOrigin.copy(center).add(new THREE.Vector3(0, maxDim * 0.05, maxDim * 0.18));
+        offAxis.screenHeight = Math.max(maxDim * 0.95, 1);
+        offAxis.baseDistance = Math.max(maxDim * 1.35, 1.2);
+        if (!offAxis.tracking) offAxis.headTarget.set(0, 0, offAxis.baseDistance);
+        if (!offAxis.tracking) offAxis.head.copy(offAxis.headTarget);
+        offAxis.refEyeDist = null;
+      }
+
+      function updateHeadTracking() {
+        if (!offAxis.enabled) return;
+        if (!offAxis.tracking) {
+          offAxis.head.lerp(offAxis.headTarget, 0.18);
+          return;
+        }
+        if (!offAxis.faceLandmarker) return;
+        if (webcamVideo.readyState < 2) return;
+
+        const nowMs = performance.now();
+        if (webcamVideo.currentTime === offAxis.lastVideoTime) return;
+        offAxis.lastVideoTime = webcamVideo.currentTime;
+
+        const result = offAxis.faceLandmarker.detectForVideo(webcamVideo, nowMs);
+        const landmarks = result?.faceLandmarks?.[0];
+        if (!landmarks) return;
+
+        const leftEye = landmarks[33];
+        const rightEye = landmarks[263];
+        if (!leftEye || !rightEye) return;
+
+        const centerX = (leftEye.x + rightEye.x) * 0.5;
+        const centerY = (leftEye.y + rightEye.y) * 0.5;
+        const eyeDist = Math.hypot(leftEye.x - rightEye.x, leftEye.y - rightEye.y);
+        if (!Number.isFinite(eyeDist) || eyeDist <= 0) return;
+        if (!offAxis.refEyeDist) offAxis.refEyeDist = eyeDist;
+
+        const width = canvas.clientWidth;
+        const height = canvas.clientHeight;
+        if (width === 0 || height === 0) return;
+        const aspect = width / height;
+        const screenWidth = offAxis.screenHeight * aspect;
+        const gain = Number(parallaxGainEl.value);
+
+        const x = (centerX - 0.5) * screenWidth * gain;
+        const y = -(centerY - 0.5) * offAxis.screenHeight * gain;
+        const depthRatio = THREE.MathUtils.clamp(offAxis.refEyeDist / eyeDist, 0.7, 1.8);
+        const z = offAxis.baseDistance * depthRatio;
+
+        offAxis.headTarget.set(x, y, z);
+        offAxis.head.lerp(offAxis.headTarget, 0.22);
+      }
+
+      function updateOffAxisCamera() {
+        if (!currentRoot) return;
+        const width = canvas.clientWidth;
+        const height = canvas.clientHeight;
+        if (width === 0 || height === 0) return;
+
+        const aspect = width / height;
+        const screenWidth = offAxis.screenHeight * aspect;
+        const origin = offAxis.screenOrigin;
+
+        offAxisTmp.pa.set(origin.x - screenWidth / 2, origin.y - offAxis.screenHeight / 2, origin.z);
+        offAxisTmp.pb.set(origin.x + screenWidth / 2, origin.y - offAxis.screenHeight / 2, origin.z);
+        offAxisTmp.pc.set(origin.x - screenWidth / 2, origin.y + offAxis.screenHeight / 2, origin.z);
+
+        offAxisTmp.vr.subVectors(offAxisTmp.pb, offAxisTmp.pa).normalize();
+        offAxisTmp.vu.subVectors(offAxisTmp.pc, offAxisTmp.pa).normalize();
+        offAxisTmp.vn.crossVectors(offAxisTmp.vr, offAxisTmp.vu).normalize(); // points toward viewer
+
+        offAxisTmp.eye.copy(origin).add(offAxis.head);
+
+        offAxisTmp.va.subVectors(offAxisTmp.pa, offAxisTmp.eye);
+        offAxisTmp.vb.subVectors(offAxisTmp.pb, offAxisTmp.eye);
+        offAxisTmp.vc.subVectors(offAxisTmp.pc, offAxisTmp.eye);
+
+        const d = Math.max(0.01, -offAxisTmp.va.dot(offAxisTmp.vn));
+        const near = camera.near;
+        const far = camera.far;
+        const l = (offAxisTmp.vr.dot(offAxisTmp.va) * near) / d;
+        const r = (offAxisTmp.vr.dot(offAxisTmp.vb) * near) / d;
+        const b = (offAxisTmp.vu.dot(offAxisTmp.va) * near) / d;
+        const t = (offAxisTmp.vu.dot(offAxisTmp.vc) * near) / d;
+
+        camera.projectionMatrix.makePerspective(l, r, t, b, near, far);
+        camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+
+        offAxisTmp.basis.makeBasis(offAxisTmp.vr, offAxisTmp.vu, offAxisTmp.vn);
+        offAxisTmp.basis.setPosition(offAxisTmp.eye);
+        camera.matrixWorld.copy(offAxisTmp.basis);
+        camera.matrixWorldInverse.copy(offAxisTmp.basis).invert();
+        camera.position.copy(offAxisTmp.eye);
+      }
+
+      async function startTracking() {
+        try {
+          setStatus("请求摄像头权限…");
+          webcamPane.style.display = "block";
+
+          if (!offAxis.faceLandmarker) {
+            setStatus("加载追踪模型…");
+            const vision = await import(
+              "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs"
+            );
+            const fileset = await vision.FilesetResolver.forVisionTasks(
+              "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+            );
+            offAxis.faceLandmarker = await vision.FaceLandmarker.createFromOptions(fileset, {
+              baseOptions: {
+                modelAssetPath:
+                  "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+                delegate: "GPU"
+              },
+              runningMode: "VIDEO",
+              numFaces: 1
+            });
+          }
+
+          offAxis.stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: "user" },
+            audio: false
+          });
+          webcamVideo.srcObject = offAxis.stream;
+          await webcamVideo.play();
+
+          offAxis.tracking = true;
+          offAxis.lastVideoTime = -1;
+          offAxis.refEyeDist = null;
+          trackBtn.textContent = "停止追踪";
+          if (!offAxis.enabled) {
+            offAxisToggleEl.checked = true;
+            setOffAxisEnabled(true);
+          }
+          setStatus("追踪中（单人）");
+        } catch (err) {
+          console.error(err);
+          stopTracking();
+          setStatus("开启追踪失败（检查权限/摄像头）");
+        }
+      }
+
+      function stopTracking() {
+        offAxis.tracking = false;
+        trackBtn.textContent = "开启追踪";
+        offAxis.refEyeDist = null;
+        offAxis.lastVideoTime = -1;
+        webcamPane.style.display = "none";
+        if (offAxis.stream) {
+          for (const t of offAxis.stream.getTracks()) t.stop();
+          offAxis.stream = null;
+        }
+        webcamVideo.srcObject = null;
+        setStatus(offAxis.enabled ? "提示：移动鼠标可模拟头动" : "");
+      }
 
       function createToonGradientMap(steps) {
         const data = new Uint8Array(steps * 4);
