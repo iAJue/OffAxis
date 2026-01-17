@@ -20,9 +20,14 @@ export function createAnimeController({ scene, dirLight }) {
   scene.add(ground);
   const sparkles = createSparkles();
   scene.add(sparkles);
+  // 房间：墙/地/顶（前方留空，方便看模型）
+  const room = createRoom(toonGradientMap);
+  scene.add(room.group);
 
   // enabled：是否开启二次元效果（材质/环境都会受影响）
   let enabled = true;
+  // roomEnabled：是否显示房间环境（显示时会隐藏天空/地面圆盘）
+  let roomEnabled = false;
   // currentRoot：当前模型的根节点（gltf.scene）
   let currentRoot = null;
 
@@ -34,6 +39,15 @@ export function createAnimeController({ scene, dirLight }) {
     enabled = Boolean(nextEnabled);
     updateEnvironmentStyle();
     if (currentRoot) applyAnimeStyle(currentRoot, enabled);
+  }
+
+  /**
+   * 开关房间环境。
+   * @param {boolean} nextEnabled
+   */
+  function setRoomEnabled(nextEnabled) {
+    roomEnabled = Boolean(nextEnabled);
+    updateEnvironmentStyle();
   }
 
   /**
@@ -50,7 +64,7 @@ export function createAnimeController({ scene, dirLight }) {
    */
   function update(camera, timeSec) {
     updateSparkles(sparkles, timeSec);
-    sky.position.copy(camera.position);
+    if (sky.visible) sky.position.copy(camera.position);
   }
 
   /**
@@ -74,6 +88,9 @@ export function createAnimeController({ scene, dirLight }) {
     sparkles.position.copy(center);
     resetSparkles(sparkles);
 
+    // 房间：跟随模型中心与底部，尺寸按模型大小自适应
+    room.updateForModel({ center, maxDim, floorY: groundY });
+
     // 主光：对准模型中心，阴影范围随模型变大/变小
     dirLight.target.position.copy(center);
     dirLight.target.updateMatrixWorld();
@@ -93,13 +110,18 @@ export function createAnimeController({ scene, dirLight }) {
     sky.material.uniforms.topColor.value.set(enabled ? 0x60a5fa : 0x0b1220);
     sky.material.uniforms.bottomColor.value.set(enabled ? 0xfbcfe8 : 0x0b1220);
     // 地面：开启更亮更不透明，关闭更暗更透明
-    ground.visible = true;
+    ground.visible = !roomEnabled;
     ground.material.color.set(enabled ? 0xf8fafc : 0x111827);
     ground.material.opacity = enabled ? 0.96 : 0.45;
     ground.material.transparent = true;
     ground.material.needsUpdate = true;
     // 粒子只在二次元开启时显示
     sparkles.visible = enabled;
+
+    // 房间环境：显示时隐藏天空（避免“穿帮”），并按 enabled 调整配色/窗光
+    room.group.visible = roomEnabled;
+    sky.visible = !roomEnabled;
+    room.setStyleEnabled(enabled);
   }
 
   /**
@@ -196,11 +218,366 @@ export function createAnimeController({ scene, dirLight }) {
     get enabled() {
       return enabled;
     },
+    get roomEnabled() {
+      return roomEnabled;
+    },
     setEnabled,
+    setRoomEnabled,
     setCurrentRoot,
     updateForModel,
     update
   };
+}
+
+/**
+ * 房间实现：用 PlaneGeometry 拼一个三面墙 + 地板 + 天花板的盒子。
+ * - 前方（+Z）留空，方便相机看进去
+ * - 尺寸会在 updateForModel() 里按模型大小调整
+ */
+function createRoom(gradientMap) {
+  const group = new THREE.Group();
+  group.name = "room";
+
+  // 房间补光：避免 Toon 在阴影里“发黑一片”
+  // 注：这是环境光，不投射阴影；房间开关会控制 group.visible，所以不用额外开关
+  const fillLight = new THREE.AmbientLight(0xffffff, 0.35);
+  group.add(fillLight);
+
+  const floorMat = new THREE.MeshToonMaterial({
+    color: 0xf8fafc,
+    gradientMap,
+    transparent: true,
+    opacity: 0.98
+  });
+  const wallMat = new THREE.MeshToonMaterial({
+    // 墙面默认用更亮的暖色，避免“看起来全黑”
+    color: 0xfff1f2,
+    gradientMap,
+    transparent: true,
+    opacity: 0.92
+  });
+  const ceilingMat = new THREE.MeshToonMaterial({
+    color: 0xf0f9ff,
+    gradientMap,
+    transparent: true,
+    opacity: 0.92
+  });
+
+  // 让墙/顶在弱光环境也不至于全黑：加一点 emissive（自发光）
+  wallMat.emissive = new THREE.Color(0x111827);
+  wallMat.emissiveIntensity = 0.12;
+  ceilingMat.emissive = new THREE.Color(0x0b1220);
+  ceilingMat.emissiveIntensity = 0.08;
+
+  // 单位平面（宽=1, 高=1），后续用 scale 调整到真实尺寸
+  const plane = new THREE.PlaneGeometry(1, 1, 1, 1);
+  const unitBox = new THREE.BoxGeometry(1, 1, 1);
+
+  const floor = new THREE.Mesh(plane, floorMat);
+  floor.rotation.x = -Math.PI / 2;
+  floor.receiveShadow = true;
+  group.add(floor);
+
+  const ceiling = new THREE.Mesh(plane, ceilingMat);
+  ceiling.rotation.x = Math.PI / 2;
+  group.add(ceiling);
+
+  const backWall = new THREE.Mesh(plane, wallMat);
+  backWall.rotation.y = Math.PI; // 朝向房间内部
+  backWall.receiveShadow = true;
+  group.add(backWall);
+
+  const leftWall = new THREE.Mesh(plane, wallMat);
+  leftWall.rotation.y = -Math.PI / 2;
+  leftWall.receiveShadow = true;
+  group.add(leftWall);
+
+  const rightWall = new THREE.Mesh(plane, wallMat);
+  rightWall.rotation.y = Math.PI / 2;
+  rightWall.receiveShadow = true;
+  group.add(rightWall);
+
+  // “窗光”：一块自发光平面，贴在后墙上（略微前移避免 z-fighting）
+  const windowMat = new THREE.MeshBasicMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0.9
+  });
+  const windowPane = new THREE.Mesh(plane, windowMat);
+  windowPane.name = "roomWindow";
+  group.add(windowPane);
+
+  // 家具：尽量靠墙摆放，避免遮挡模型（模型一般在房间中央）
+  const furniture = new THREE.Group();
+  furniture.name = "roomFurniture";
+  group.add(furniture);
+
+  const woodMat = new THREE.MeshToonMaterial({ color: 0xd6a77a, gradientMap });
+  woodMat.emissive = new THREE.Color(0x111827);
+  woodMat.emissiveIntensity = 0.03;
+  const fabricMat = new THREE.MeshToonMaterial({ color: 0xbfdbfe, gradientMap });
+  fabricMat.emissive = new THREE.Color(0x0b1220);
+  fabricMat.emissiveIntensity = 0.03;
+  const darkMat = new THREE.MeshToonMaterial({ color: 0x334155, gradientMap });
+  darkMat.emissive = new THREE.Color(0x0b1220);
+  darkMat.emissiveIntensity = 0.04;
+
+  // 地毯（纯色+轻微自发光，弱光也能看见）
+  const rugMat = new THREE.MeshToonMaterial({
+    color: 0xfbcfe8,
+    gradientMap,
+    transparent: true,
+    opacity: 0.9
+  });
+  rugMat.emissive = new THREE.Color(0x111827);
+  rugMat.emissiveIntensity = 0.02;
+  const rug = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), rugMat);
+  rug.rotation.x = -Math.PI / 2;
+  rug.position.y = 0.01;
+  rug.receiveShadow = true;
+  furniture.add(rug);
+
+  // 桌子（桌面 + 桌腿）
+  const desk = new THREE.Group();
+  desk.name = "desk";
+  furniture.add(desk);
+  const deskTop = new THREE.Mesh(unitBox, woodMat);
+  deskTop.castShadow = true;
+  deskTop.receiveShadow = true;
+  desk.add(deskTop);
+  const deskLegs = [];
+  for (let i = 0; i < 4; i++) {
+    const leg = new THREE.Mesh(unitBox, darkMat);
+    leg.castShadow = true;
+    leg.receiveShadow = true;
+    deskLegs.push(leg);
+    desk.add(leg);
+  }
+
+  // 椅子（座 + 靠背 + 四腿）
+  const chair = new THREE.Group();
+  chair.name = "chair";
+  furniture.add(chair);
+  const chairSeat = new THREE.Mesh(unitBox, fabricMat);
+  chairSeat.castShadow = true;
+  chairSeat.receiveShadow = true;
+  chair.add(chairSeat);
+  const chairBack = new THREE.Mesh(unitBox, fabricMat);
+  chairBack.castShadow = true;
+  chairBack.receiveShadow = true;
+  chair.add(chairBack);
+  const chairLegs = [];
+  for (let i = 0; i < 4; i++) {
+    const leg = new THREE.Mesh(unitBox, darkMat);
+    leg.castShadow = true;
+    leg.receiveShadow = true;
+    chairLegs.push(leg);
+    chair.add(leg);
+  }
+
+  // 床（床架 + 床垫 + 枕头 + 床头板）
+  const bed = new THREE.Group();
+  bed.name = "bed";
+  furniture.add(bed);
+  const bedBase = new THREE.Mesh(unitBox, woodMat);
+  bedBase.castShadow = true;
+  bedBase.receiveShadow = true;
+  bed.add(bedBase);
+  const mattress = new THREE.Mesh(unitBox, fabricMat);
+  mattress.castShadow = true;
+  mattress.receiveShadow = true;
+  bed.add(mattress);
+  const pillow = new THREE.Mesh(unitBox, new THREE.MeshToonMaterial({ color: 0xffffff, gradientMap }));
+  pillow.castShadow = true;
+  pillow.receiveShadow = true;
+  bed.add(pillow);
+  const headboard = new THREE.Mesh(unitBox, woodMat);
+  headboard.castShadow = true;
+  headboard.receiveShadow = true;
+  bed.add(headboard);
+
+  // 书架（框 + 三层隔板）
+  const shelf = new THREE.Group();
+  shelf.name = "shelf";
+  furniture.add(shelf);
+  const shelfFrame = new THREE.Mesh(unitBox, woodMat);
+  shelfFrame.castShadow = true;
+  shelfFrame.receiveShadow = true;
+  shelf.add(shelfFrame);
+  const shelfBoards = [];
+  for (let i = 0; i < 3; i++) {
+    const board = new THREE.Mesh(unitBox, darkMat);
+    board.castShadow = true;
+    board.receiveShadow = true;
+    shelfBoards.push(board);
+    shelf.add(board);
+  }
+
+  // 台灯（一个小点光，配合弱自发光让房间更“有生活”）
+  const lamp = new THREE.Group();
+  lamp.name = "lamp";
+  furniture.add(lamp);
+  const lampBase = new THREE.Mesh(unitBox, darkMat);
+  lampBase.castShadow = true;
+  lampBase.receiveShadow = true;
+  lamp.add(lampBase);
+  const lampShadeMat = new THREE.MeshToonMaterial({ color: 0xfffbeb, gradientMap });
+  lampShadeMat.emissive = new THREE.Color(0xfff7ed);
+  lampShadeMat.emissiveIntensity = 0.55;
+  const lampShade = new THREE.Mesh(unitBox, lampShadeMat);
+  lampShade.castShadow = false;
+  lampShade.receiveShadow = false;
+  lamp.add(lampShade);
+  const lampLight = new THREE.PointLight(0xfff1c7, 0.65, 0, 2);
+  lampLight.castShadow = false;
+  lamp.add(lampLight);
+
+  function setStyleEnabled(styleEnabled) {
+    // 开启二次元时：房间更明亮；关闭时：房间变暗
+    floorMat.color.set(styleEnabled ? 0xf8fafc : 0x111827);
+    floorMat.opacity = styleEnabled ? 0.98 : 0.55;
+    // 关闭时也保持“有墙面细节”，不要全黑
+    wallMat.color.set(styleEnabled ? 0xfff1f2 : 0x334155);
+    wallMat.opacity = styleEnabled ? 0.92 : 0.65;
+    ceilingMat.color.set(styleEnabled ? 0xf0f9ff : 0x1f2937);
+    ceilingMat.opacity = styleEnabled ? 0.92 : 0.55;
+    windowPane.visible = styleEnabled;
+    windowMat.opacity = styleEnabled ? 0.9 : 0.0;
+    fillLight.intensity = styleEnabled ? 0.35 : 0.22;
+    lampLight.intensity = styleEnabled ? 0.65 : 0.25;
+  }
+
+  function updateForModel({ center, maxDim, floorY }) {
+    // room 放在模型中心下方（地板贴近 floorY）
+    group.position.set(center.x, floorY, center.z);
+
+    // 经验系数：让模型在房间里有足够留白
+    const width = Math.max(maxDim * 2.6, 2.5);
+    const depth = Math.max(maxDim * 3.2, 3.0);
+    const height = Math.max(maxDim * 1.8, 2.2);
+
+    // 地板/天花板：PlaneGeometry 的 (width,height) 映射到 (x,z)
+    floor.scale.set(width, depth, 1);
+    floor.position.set(0, 0, 0);
+
+    ceiling.scale.set(width, depth, 1);
+    ceiling.position.set(0, height, 0);
+
+    // 后墙：PlaneGeometry 的 (width,height) 映射到 (x,y)
+    backWall.scale.set(width, height, 1);
+    backWall.position.set(0, height / 2, -depth / 2);
+
+    // 左右墙：PlaneGeometry 的 (width,height) 映射到 (z,y)
+    leftWall.scale.set(depth, height, 1);
+    leftWall.position.set(-width / 2, height / 2, 0);
+
+    rightWall.scale.set(depth, height, 1);
+    rightWall.position.set(width / 2, height / 2, 0);
+
+    // 窗光：贴在后墙上方
+    windowPane.scale.set(width * 0.42, height * 0.26, 1);
+    windowPane.rotation.y = Math.PI; // 与后墙同向
+    windowPane.position.set(0, height * 0.68, -depth / 2 + 0.001);
+
+    // 家具布局：靠后墙/两侧墙，留出房间中央给模型
+    rug.scale.set(width * 0.55, depth * 0.42, 1);
+    rug.position.set(0, 0.01, depth * 0.05);
+
+    // 桌子：靠后墙偏左
+    const deskW = width * 0.32;
+    const deskD = depth * 0.16;
+    const deskH = height * 0.26;
+    desk.position.set(-width * 0.22, 0, -depth / 2 + deskD / 2 + 0.12);
+    deskTop.scale.set(deskW, deskH * 0.12, deskD);
+    deskTop.position.set(0, deskH * 0.92, 0);
+    const legW = deskW * 0.06;
+    const legH = deskH * 0.9;
+    const legD = deskD * 0.06;
+    const lx = deskW * 0.45;
+    const lz = deskD * 0.45;
+    const legPositions = [
+      [-lx, legH * 0.45, -lz],
+      [lx, legH * 0.45, -lz],
+      [-lx, legH * 0.45, lz],
+      [lx, legH * 0.45, lz]
+    ];
+    for (let i = 0; i < 4; i++) {
+      const leg = deskLegs[i];
+      leg.scale.set(legW, legH, legD);
+      leg.position.set(legPositions[i][0], legPositions[i][1], legPositions[i][2]);
+    }
+
+    // 椅子：放在桌子前面一点（朝向桌子）
+    const chairW = deskW * 0.32;
+    const chairD = deskD * 0.62;
+    const chairH = deskH * 0.78;
+    chair.position.set(desk.position.x, 0, desk.position.z + deskD * 0.75);
+    chair.rotation.y = Math.PI; // 面向后墙（即面向桌子）
+    chairSeat.scale.set(chairW, chairH * 0.12, chairD);
+    chairSeat.position.set(0, chairH * 0.42, 0);
+    chairBack.scale.set(chairW, chairH * 0.45, chairD * 0.12);
+    chairBack.position.set(0, chairH * 0.74, -chairD * 0.44);
+    const cLegW = chairW * 0.08;
+    const cLegH = chairH * 0.4;
+    const cLegD = chairD * 0.08;
+    const clx = chairW * 0.42;
+    const clz = chairD * 0.42;
+    const cLegPositions = [
+      [-clx, cLegH * 0.5, -clz],
+      [clx, cLegH * 0.5, -clz],
+      [-clx, cLegH * 0.5, clz],
+      [clx, cLegH * 0.5, clz]
+    ];
+    for (let i = 0; i < 4; i++) {
+      const leg = chairLegs[i];
+      leg.scale.set(cLegW, cLegH, cLegD);
+      leg.position.set(cLegPositions[i][0], cLegPositions[i][1], cLegPositions[i][2]);
+    }
+
+    // 床：靠后墙偏右（头朝后墙）
+    const bedW = width * 0.34;
+    const bedD = depth * 0.28;
+    const bedH = height * 0.18;
+    bed.position.set(width * 0.22, 0, -depth / 2 + bedD / 2 + 0.12);
+    bed.rotation.y = Math.PI; // 头朝后墙
+    bedBase.scale.set(bedW, bedH * 0.5, bedD);
+    bedBase.position.set(0, bedH * 0.25, 0);
+    mattress.scale.set(bedW * 0.98, bedH * 0.55, bedD * 0.98);
+    mattress.position.set(0, bedH * 0.78, 0);
+    pillow.scale.set(bedW * 0.32, bedH * 0.22, bedD * 0.22);
+    pillow.position.set(0, bedH * 1.05, -bedD * 0.34);
+    headboard.scale.set(bedW, bedH * 0.9, bedD * 0.08);
+    headboard.position.set(0, bedH * 0.9, -bedD * 0.5 + 0.02);
+
+    // 书架：靠右墙中段
+    const shelfW = depth * 0.18;
+    const shelfD = width * 0.06;
+    const shelfH = height * 0.62;
+    shelf.position.set(width / 2 - shelfD / 2 - 0.08, 0, -depth * 0.05);
+    shelf.rotation.y = Math.PI / 2; // 朝向房间内侧
+    shelfFrame.scale.set(shelfD, shelfH, shelfW);
+    shelfFrame.position.set(0, shelfH / 2, 0);
+    for (let i = 0; i < 3; i++) {
+      const board = shelfBoards[i];
+      board.scale.set(shelfD * 0.9, shelfH * 0.04, shelfW * 0.9);
+      board.position.set(0, shelfH * (0.22 + i * 0.25), 0);
+    }
+
+    // 台灯：放桌面上，稍微靠近房间中央
+    const lampS = deskW * 0.12;
+    lamp.position.set(desk.position.x + deskW * 0.18, 0, desk.position.z + deskD * 0.08);
+    lampBase.scale.set(lampS * 0.6, deskH * 0.06, lampS * 0.6);
+    lampBase.position.set(0, deskH * 0.98, 0);
+    lampShade.scale.set(lampS, deskH * 0.16, lampS);
+    lampShade.position.set(0, deskH * 1.1, 0);
+    lampLight.position.set(0, deskH * 1.12, 0);
+  }
+
+  // 默认隐藏，由 UI 控制
+  group.visible = false;
+  setStyleEnabled(true);
+
+  return { group, updateForModel, setStyleEnabled };
 }
 
 /**

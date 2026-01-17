@@ -20,6 +20,7 @@ const statusEl = document.getElementById("status");
 const selectEl = document.getElementById("modelSelect");
 const reloadBtn = document.getElementById("reloadBtn");
 const animeToggleEl = document.getElementById("animeToggle");
+const roomToggleEl = document.getElementById("roomToggle");
 const offAxisToggleEl = document.getElementById("offAxisToggle");
 const parallaxGainEl = document.getElementById("parallaxGain");
 const trackBtn = document.getElementById("trackBtn");
@@ -93,6 +94,11 @@ animeToggleEl.addEventListener("change", () => {
   anime.setEnabled(animeToggleEl.checked);
 });
 
+// 房间环境开关
+roomToggleEl.addEventListener("change", () => {
+  anime.setRoomEnabled(roomToggleEl.checked);
+});
+
 // 裸眼3D（off-axis）开关：开启后会禁用 OrbitControls，改为离轴相机驱动
 offAxisToggleEl.addEventListener("change", () => {
   offAxis.setEnabled(offAxisToggleEl.checked);
@@ -153,6 +159,7 @@ function animate() {
 async function init() {
   // 初始化时应用 UI 默认值
   anime.setEnabled(animeToggleEl.checked);
+  anime.setRoomEnabled(roomToggleEl.checked);
   offAxis.setEnabled(offAxisToggleEl.checked);
 
   // 默认加载第一个模型（或当前 select 的值）
