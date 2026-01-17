@@ -26,6 +26,10 @@ export function createOffAxisController({
   setStatus,
   getParallaxGain
 }) {
+  // 右下角预览 video 做了 CSS scaleX(-1) 镜像；MediaPipe 输出坐标基于“未镜像”的原始视频帧。
+  // 为了让“头往左 -> 视角往右（看到人物左侧）”符合直觉，这里需要把 tracking 的 X 方向翻转。
+  const mirroredWebcamPreview = true;
+
   const state = {
     // enabled：off-axis 模式开关。开启后会禁用 OrbitControls，并直接写 camera.matrixWorld/projectionMatrix
     enabled: false,
@@ -190,7 +194,8 @@ export function createOffAxisController({
     const gain = getParallaxGain();
 
     // x/y：以画面中心为 0，向右/向上为正（y 取反让屏幕坐标更直观）
-    const x = (centerX - 0.5) * screenWidth * gain;
+    const dx = centerX - 0.5;
+    const x = (mirroredWebcamPreview ? -dx : dx) * screenWidth * gain;
     const y = -(centerY - 0.5) * state.screenHeight * gain;
 
     // z：用“参考眼距 / 当前眼距”估计深度比例（范围做 clamp 防止爆炸）
